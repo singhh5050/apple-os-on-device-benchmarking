@@ -1,6 +1,6 @@
 # Apple‑OS On‑Device Benchmarking
 
-A tiny SwiftUI app for stress‑testing Apple’s on‑device **LanguageModelSession** (LLM) APIs.  It runs a bank of reasoning + generative prompts multiple times, logs latency/throughput metrics, and exports full CSVs—perfect for quick performance pokes at iPhone/iPad hardware.
+A SwiftUI app for stress‑testing Apple’s on‑device **LanguageModelSession** (LLM) APIs.  It runs a bank of reasoning + generative prompts multiple times, logs latency/throughput metrics, and exports full CSVs—perfect for quick performance pokes at iPhone/iPad hardware.
 
 ---
 
