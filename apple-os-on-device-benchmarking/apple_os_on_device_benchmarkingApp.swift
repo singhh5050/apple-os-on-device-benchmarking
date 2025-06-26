@@ -69,6 +69,12 @@ struct BenchmarkResult: Identifiable {
     let ttftMs: Double
     let latencyMs: Double
     var tps: Double { latencyMs > 0 ? Double(tokenCount) / (latencyMs / 1_000) : 0 }
+
+    let tokenTimeline: [TokenSample]
+    let peakMemoryBytes: UInt64
+    let peakMemoryToken: Int
+    let peakThermalLevel: Int   // 0‒3
+    let peakThermalToken: Int
 }
 
 // MARK: –– Prompt that failed + error that bubbled up
@@ -85,6 +91,42 @@ private func stats(_ values: [Double]) -> Stats {
     let m = values.reduce(0, +) / Double(values.count)
     let varSum = values.reduce(0) { $0 + pow($1 - m, 2) }
     return .init(mean: m, sd: sqrt(varSum / Double(values.count)))
+}
+
+// Returns resident-plus-compressed footprint in bytes (same metric Xcode shows)
+func physFootprintBytes() -> UInt64 {
+    var info  = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout.size(ofValue: info) /
+                                       MemoryLayout<Int32>.size)
+
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_,
+                      task_flavor_t(TASK_VM_INFO),
+                      $0,
+                      &count)
+        }
+    }
+    return kr == KERN_SUCCESS ? info.phys_footprint : 0
+}
+
+// 0 = nominal, 1 = fair, 2 = serious, 3 = critical
+@inline(__always)
+func thermalBucket() -> Int {
+    switch ProcessInfo.processInfo.thermalState {
+    case .nominal:   return 0
+    case .fair:      return 1
+    case .serious:   return 2
+    case .critical:  return 3
+    @unknown default: return -1
+    }
+}
+
+// Per-token telemetry row (handy for the token-timeline CSV)
+struct TokenSample: Codable {
+    let tokenIndex: Int
+    let memoryBytes: UInt64
+    let thermalLevel: Int  // 0-3
 }
 
 struct AggregatedMetrics: Identifiable {
@@ -106,6 +148,7 @@ final class BenchmarkRunner: ObservableObject {
     @Published var errorMsg: String? = nil
     @Published var csvURL: URL? = nil
     @Published var failureURL: URL? = nil
+    @Published var timelineURL: URL? = nil
     @Published var coldStartMode = false
     @Published var failures: [FailedRun] = []
     
@@ -130,6 +173,7 @@ final class BenchmarkRunner: ObservableObject {
         progress   = 0
         csvURL     = nil
         failureURL = nil
+        timelineURL = nil
         
         // ── Warm-up run (only once, warm mode)
         if !coldStartMode {
@@ -204,16 +248,26 @@ final class BenchmarkRunner: ObservableObject {
             }
             
             // ── Build main CSV
-            var csv = "prompt,difficulty,type,tokens,ttftMs,latencyMs,tps\n"
-            for r in runLog {
+            var timeline = "runIndex,tokenIndex,memoryBytes,thermalLevel\n"
+            var csv = "prompt,difficulty,type,tokens,ttftMs,latencyMs,tps,peakMemBytes,peakMemToken,peakThermLvl,peakThermToken\n"
+            for (runIdx, r) in runLog.enumerated() {              // 🆕 enumerate
                 let p = r.prompt
-                csv += "\"\(p.text.replacingOccurrences(of:"\"",with:"\"\""))\","
+                csv += "\"\(p.text.replacingOccurrences(of: "\"", with: "\"\""))\","
                 + "\(p.difficulty.rawValue),"
                 + (p.type == .reasoning ? "reasoning" : "generative") + ","
                 + "\(r.tokenCount),"
                 + String(format: "%.1f", r.ttftMs) + ","
                 + String(format: "%.1f", r.latencyMs) + ","
-                + String(format: "%.2f", r.tps) + "\n"
+                + String(format: "%.2f", r.tps) + ","
+                + "\(r.peakMemoryBytes),"
+                + "\(r.peakMemoryToken),"
+                + "\(r.peakThermalLevel),"
+                + "\(r.peakThermalToken)\n"
+                
+                // 🆕 one line per token
+                for s in r.tokenTimeline {
+                    timeline += "\(runIdx),\(s.tokenIndex),\(s.memoryBytes),\(s.thermalLevel)\n"
+                }
             }
             
             // ── Write both CSVs
@@ -223,6 +277,10 @@ final class BenchmarkRunner: ObservableObject {
                 let outURL = docs.appendingPathComponent("benchmark_results.csv")
                 do {
                     try csv.write(to: outURL, atomically: true, encoding: .utf8)
+                    
+                    let tlURL = docs.appendingPathComponent("benchmark_token_timeline.csv")
+                    try timeline.write(to: tlURL, atomically: true, encoding: .utf8)
+                    self.timelineURL = tlURL
                     
                     // ---- Dump failures CSV
                     let allFailures = firstPassFailures + stillFailed   // local list
@@ -256,6 +314,11 @@ final class BenchmarkRunner: ObservableObject {
 
         var tokenCount = 0
         var generated = ""
+        var tokenSamples: [TokenSample] = []
+        var peakMemBytes: UInt64 = 0
+        var peakMemToken  = 0
+        var peakThermLvl  = 0
+        var peakThermTok  = 0
         let start = Date(); var firstTokenTime: Date? = nil
 
         let stream = session.streamResponse(to: prompt.text)
@@ -263,6 +326,15 @@ final class BenchmarkRunner: ObservableObject {
             tokenCount += 1
             generated = chunk
             if firstTokenTime == nil { firstTokenTime = Date() }
+
+            let mem   = physFootprintBytes()
+            let therm = thermalBucket()
+            let idx   = tokenCount - 1
+            tokenSamples.append(.init(tokenIndex: idx,
+                                      memoryBytes: mem,
+                                      thermalLevel: therm))
+            if mem   > peakMemBytes { peakMemBytes = mem;   peakMemToken = idx }
+            if therm > peakThermLvl { peakThermLvl = therm; peakThermTok  = idx }
         }
 
         let end = Date()
@@ -270,11 +342,18 @@ final class BenchmarkRunner: ObservableObject {
         let ttftMs = (firstTokenTime ?? end).timeIntervalSince(start) * 1_000
 
         os_signpost(.end, log: log, name: "LLM Prompt")
-        return BenchmarkResult(prompt: prompt,
-                               generated: generated,
-                               tokenCount: tokenCount,
-                               ttftMs: ttftMs,
-                               latencyMs: latencyMs)
+        return BenchmarkResult(
+            prompt: prompt,
+            generated: generated,
+            tokenCount: tokenCount,
+            ttftMs: ttftMs,
+            latencyMs: latencyMs,
+            tokenTimeline: tokenSamples,
+            peakMemoryBytes: peakMemBytes,
+            peakMemoryToken: peakMemToken,
+            peakThermalLevel: peakThermLvl,
+            peakThermalToken: peakThermTok
+        )
     }
 }
 
@@ -391,8 +470,15 @@ struct ContentView: View {
                         ShareLink(item: url,
                                   preview: SharePreview("benchmark_results.csv",
                                                         image: Image(systemName: "square.and.arrow.up")))
+                        if let tl = runner.timelineURL {
+                            ShareLink(item: tl,
+                                      preview: SharePreview("benchmark_token_timeline.csv",
+                                                            image: Image(systemName: "chart.bar.xaxis")))
+                        }
                     }
                 }
+                
+                
                 
                 // Export failures CSV
                 if let failURL = runner.failureURL {
